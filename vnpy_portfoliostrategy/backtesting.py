@@ -51,6 +51,7 @@ class BacktestingEngine:
         self.priceticks: dict[str, float]
 
         self.capital: float = 1_000_000
+        self.cash: float = self.capital
         self.risk_free: float = 0
         self.annual_days: int = 240
 
@@ -84,6 +85,7 @@ class BacktestingEngine:
 
         self.trade_count = 0
         self.trades.clear()
+        self.cash = self.capital
 
         self.logs.clear()
         self.daily_results.clear()
@@ -119,6 +121,7 @@ class BacktestingEngine:
             self.end = end.replace(hour=23, minute=59, second=59)
 
         self.capital = capital
+        self.cash = capital
         self.risk_free = risk_free
         self.annual_days = annual_days
 
@@ -665,6 +668,18 @@ class BacktestingEngine:
                 gateway_name=self.gateway_name,
             )
 
+            size: float = self.sizes[trade.vt_symbol]
+            turnover: float = trade.price * trade.volume * size
+            commission: float = turnover * self.rates[trade.vt_symbol]
+            slippage: float = trade.volume * size * self.slippages[trade.vt_symbol]
+
+            if trade.direction == Direction.LONG:
+                self.cash -= turnover
+            else:
+                self.cash += turnover
+
+            self.cash -= commission + slippage
+
             self.strategy.update_trade(trade)
             self.trades[trade.vt_tradeid] = trade
 
@@ -745,6 +760,37 @@ class BacktestingEngine:
     def get_size(self, strategy: StrategyTemplate, vt_symbol: str) -> float:
         """获取合约乘数"""
         return self.sizes[vt_symbol]
+
+    def get_cash_available(self, strategy: StrategyTemplate | None = None) -> float:
+        """获取当前可用现金"""
+        return self.cash
+
+    def get_cash(self, strategy: StrategyTemplate | None = None) -> float:
+        """获取当前可用现金"""
+        return self.get_cash_available()
+
+    def get_holding_value(self, strategy: StrategyTemplate | None = None) -> float:
+        """获取当前持仓市值"""
+        holding_value: float = 0
+
+        strategy = strategy or self.strategy
+
+        for vt_symbol, pos in strategy.pos_data.items():
+            if not pos:
+                continue
+
+            bar: BarData | None = self.bars.get(vt_symbol)
+            if not bar:
+                continue
+
+            size: float = self.sizes[vt_symbol]
+            holding_value += bar.close_price * pos * size
+
+        return holding_value
+
+    def get_portfolio_value(self, strategy: StrategyTemplate | None = None) -> float:
+        """获取当前组合权益"""
+        return self.cash + self.get_holding_value(strategy)
 
     def put_strategy_event(self, strategy: StrategyTemplate) -> None:
         """推送事件更新策略界面"""

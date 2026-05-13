@@ -282,6 +282,22 @@ class StrategyTemplate(ABC):
         """查询合约乘数"""
         return cast(int, self.strategy_engine.get_size(self, vt_symbol))
 
+    def get_cash_available(self) -> float:
+        """查询当前可用现金"""
+        return cast(float, self.strategy_engine.get_cash_available(self))
+
+    def get_cash(self) -> float:
+        """查询当前可用现金"""
+        return self.get_cash_available()
+
+    def get_holding_value(self) -> float:
+        """查询当前持仓市值"""
+        return cast(float, self.strategy_engine.get_holding_value(self))
+
+    def get_portfolio_value(self) -> float:
+        """查询当前组合权益"""
+        return cast(float, self.strategy_engine.get_portfolio_value(self))
+
     def load_bars(self, days: int, interval: Interval = Interval.MINUTE) -> None:
         """加载历史K线数据来执行初始化"""
         self.strategy_engine.load_bars(self, days, interval)
