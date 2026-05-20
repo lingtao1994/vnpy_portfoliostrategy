@@ -1,7 +1,9 @@
-from datetime import datetime
+from datetime import date, datetime
 from unittest import TestCase
 
+from pandas import DataFrame
 
+import vnpy_portfoliostrategy.backtesting as backtesting_module
 from vnpy.trader.constant import Direction, Exchange, Interval, Offset
 from vnpy.trader.object import BarData
 from vnpy_portfoliostrategy.backtesting import BacktestingEngine
@@ -95,3 +97,70 @@ class BacktestingCashTest(TestCase):
         self.assertAlmostEqual(engine.get_holding_value(), 3 * 11.0 * 10)
         self.assertAlmostEqual(engine.get_portfolio_value(), engine.get_cash_available() + 3 * 11.0 * 10)
         self.assertAlmostEqual(engine.strategy.get_portfolio_value(), engine.get_portfolio_value())
+
+    def test_benchmark_curve_normalizes_to_initial_capital(self) -> None:
+        engine = create_engine()
+        df = DataFrame(index=[date(2024, 1, 2), date(2024, 1, 3)])
+        original_load_bar_data = backtesting_module.load_bar_data
+
+        def fake_load_bar_data(
+            vt_symbol: str,
+            interval: Interval,
+            start: datetime,
+            end: datetime
+        ) -> list[BarData]:
+            return [
+                create_bar(open_price=3000, high_price=3000, low_price=3000, close_price=3000),
+                BarData(
+                    symbol="510300",
+                    exchange=Exchange.SSE,
+                    datetime=datetime(2024, 1, 3),
+                    open_price=3300,
+                    high_price=3300,
+                    low_price=3300,
+                    close_price=3300,
+                    gateway_name=BacktestingEngine.gateway_name,
+                ),
+            ]
+
+        try:
+            backtesting_module.load_bar_data = fake_load_bar_data
+            benchmark_df = engine.calculate_benchmark_curve("000300.SSE", df)
+        finally:
+            backtesting_module.load_bar_data = original_load_bar_data
+
+        self.assertIsNotNone(benchmark_df)
+        self.assertAlmostEqual(benchmark_df["benchmark_balance"].iloc[0], 1_000)
+        self.assertAlmostEqual(benchmark_df["benchmark_balance"].iloc[1], 1_100)
+
+    def test_benchmark_curve_returns_none_when_dates_do_not_overlap(self) -> None:
+        engine = create_engine()
+        df = DataFrame(index=[date(2024, 1, 2)])
+        original_load_bar_data = backtesting_module.load_bar_data
+
+        def fake_load_bar_data(
+            vt_symbol: str,
+            interval: Interval,
+            start: datetime,
+            end: datetime
+        ) -> list[BarData]:
+            return [
+                BarData(
+                    symbol="510300",
+                    exchange=Exchange.SSE,
+                    datetime=datetime(2024, 1, 1),
+                    open_price=3000,
+                    high_price=3000,
+                    low_price=3000,
+                    close_price=3000,
+                    gateway_name=BacktestingEngine.gateway_name,
+                )
+            ]
+
+        try:
+            backtesting_module.load_bar_data = fake_load_bar_data
+            benchmark_df = engine.calculate_benchmark_curve("000300.SSE", df)
+        finally:
+            backtesting_module.load_bar_data = original_load_bar_data
+
+        self.assertIsNone(benchmark_df)

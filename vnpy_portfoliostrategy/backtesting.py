@@ -461,13 +461,63 @@ class BacktestingEngine:
         self.output(_("策略统计指标计算完成"))
         return statistics
 
-    def show_chart(self, df: DataFrame = None) -> None:
+    def calculate_benchmark_curve(self, benchmark_symbol: str, df: DataFrame = None) -> DataFrame | None:
+        """计算基准归一化资金曲线"""
+        if df is None:
+            df = self.daily_df
+
+        if df is None:
+            return None
+
+        benchmark_bars: list[BarData] = load_bar_data(
+            benchmark_symbol,
+            self.interval,
+            self.start,
+            self.end
+        )
+        benchmark_closes: dict[date, float] = {
+            bar.datetime.date(): bar.close_price
+            for bar in benchmark_bars
+            if bar.close_price > 0
+        }
+
+        if not benchmark_closes:
+            self.output(_("基准{}历史数据为空，无法绘制基准曲线").format(benchmark_symbol))
+            return None
+
+        closes: list[float] = []
+        last_close: float | None = None
+        for ix in df.index:
+            d: date = ix.date() if isinstance(ix, datetime) else ix
+            close: float | None = benchmark_closes.get(d, None)
+            if close:
+                last_close = close
+            closes.append(last_close if last_close else np.nan)
+
+        benchmark_df: DataFrame = DataFrame(index=df.index)
+        benchmark_df["benchmark_close"] = closes
+
+        valid_closes = benchmark_df["benchmark_close"].dropna()
+        if valid_closes.empty:
+            self.output(_("基准{}历史数据无法和回测日期对齐，无法绘制基准曲线").format(benchmark_symbol))
+            return None
+
+        first_valid_close: float = valid_closes.iloc[0]
+        benchmark_df["benchmark_balance"] = benchmark_df["benchmark_close"] / first_valid_close * self.capital
+
+        return benchmark_df
+
+    def show_chart(self, df: DataFrame = None, benchmark_symbol: str | None = None) -> None:
         """显示图表"""
         if df is None:
             df = self.daily_df
 
         if df is None:
             return
+
+        benchmark_df: DataFrame | None = None
+        if benchmark_symbol:
+            benchmark_df = self.calculate_benchmark_curve(benchmark_symbol, df)
 
         fig = make_subplots(
             rows=4,
@@ -482,6 +532,13 @@ class BacktestingEngine:
             mode="lines",
             name="Balance"
         )
+        if benchmark_df is not None:
+            benchmark_line = go.Scatter(
+                x=benchmark_df.index,
+                y=benchmark_df["benchmark_balance"],
+                mode="lines",
+                name=benchmark_symbol
+            )
         drawdown_scatter = go.Scatter(
             x=df.index,
             y=df["drawdown"],
@@ -494,6 +551,8 @@ class BacktestingEngine:
         pnl_histogram = go.Histogram(x=df["net_pnl"], nbinsx=100, name="Days")
 
         fig.add_trace(balance_line, row=1, col=1)
+        if benchmark_df is not None:
+            fig.add_trace(benchmark_line, row=1, col=1)
         fig.add_trace(drawdown_scatter, row=2, col=1)
         fig.add_trace(pnl_bar, row=3, col=1)
         fig.add_trace(pnl_histogram, row=4, col=1)
