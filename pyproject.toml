@@ -21,6 +21,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
+    "openpyxl>=3.1.0",
     "vnpy>=4.0.0"
 ]
 keywords = ["quant", "quantitative", "investment", "trading", "algotrading"]

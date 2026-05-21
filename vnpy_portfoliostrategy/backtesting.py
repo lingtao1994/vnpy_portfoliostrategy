@@ -1,13 +1,14 @@
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from functools import lru_cache, partial
 from copy import copy
+from pathlib import Path
 import traceback
 
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from pandas import DataFrame
+from pandas import DataFrame, ExcelWriter
 from collections.abc import Callable
 
 from vnpy.trader.constant import Direction, Offset, Interval, Status
@@ -52,7 +53,7 @@ class BacktestingEngine:
 
         self.capital: float = 1_000_000
         self.cash: float = self.capital
-        self.risk_free: float = 0
+        self.risk_free: float = 3
         self.annual_days: int = 240
 
         self.strategy_class: type[StrategyTemplate]
@@ -102,7 +103,7 @@ class BacktestingEngine:
         priceticks: dict[str, float],
         capital: float = 0,
         end: datetime | None = None,
-        risk_free: float = 0,
+        risk_free: float = 3,
         annual_days: int = 240
     ) -> None:
         """设置参数"""
@@ -289,6 +290,145 @@ class BacktestingEngine:
         self.output(_("逐日盯市盈亏计算完成"))
         return self.daily_df
 
+    def calculate_symbol_daily_pnl(self) -> DataFrame:
+        """计算按合约展开的逐日盯市盈亏"""
+        fields: list[str] = [
+            "date", "vt_symbol", "start_pos", "end_pos", "pre_close", "close_price",
+            "trade_count", "turnover", "commission", "slippage", "trading_pnl",
+            "holding_pnl", "total_pnl", "net_pnl", "contribution_pct",
+        ]
+        results: list[dict] = []
+
+        for result_date in sorted(self.daily_results):
+            daily_result: PortfolioDailyResult = self.daily_results[result_date]
+            daily_net_pnl: float = daily_result.net_pnl
+
+            for vt_symbol, contract_result in sorted(daily_result.contract_results.items()):
+                if daily_net_pnl:
+                    contribution_pct: float = contract_result.net_pnl / daily_net_pnl
+                else:
+                    contribution_pct = 0
+
+                results.append({
+                    "date": daily_result.date,
+                    "vt_symbol": vt_symbol,
+                    "start_pos": contract_result.start_pos,
+                    "end_pos": contract_result.end_pos,
+                    "pre_close": contract_result.pre_close,
+                    "close_price": contract_result.close_price,
+                    "trade_count": contract_result.trade_count,
+                    "turnover": contract_result.turnover,
+                    "commission": contract_result.commission,
+                    "slippage": contract_result.slippage,
+                    "trading_pnl": contract_result.trading_pnl,
+                    "holding_pnl": contract_result.holding_pnl,
+                    "total_pnl": contract_result.total_pnl,
+                    "net_pnl": contract_result.net_pnl,
+                    "contribution_pct": contribution_pct,
+                })
+
+        return DataFrame(results, columns=fields)
+
+    def calculate_daily_pnl_summary(self) -> DataFrame:
+        """计算每日盈亏归因摘要"""
+        detail_df: DataFrame = self.calculate_symbol_daily_pnl()
+        fields: list[str] = [
+            "date", "net_pnl", "holding_pnl", "trading_pnl", "commission", "slippage",
+            "profit_symbol_count", "loss_symbol_count", "top_profit_symbol",
+            "top_profit_pnl", "top_loss_symbol", "top_loss_pnl",
+        ]
+        results: list[dict] = []
+
+        if detail_df.empty:
+            return DataFrame(results, columns=fields)
+
+        for result_date, group_df in detail_df.groupby("date", sort=True):
+            profit_df: DataFrame = group_df[group_df["net_pnl"] > 0]
+            loss_df: DataFrame = group_df[group_df["net_pnl"] < 0]
+
+            top_profit_symbol: str = ""
+            top_profit_pnl: float = 0
+            if not profit_df.empty:
+                top_profit = profit_df.loc[profit_df["net_pnl"].idxmax()]
+                top_profit_symbol = top_profit["vt_symbol"]
+                top_profit_pnl = top_profit["net_pnl"]
+
+            top_loss_symbol: str = ""
+            top_loss_pnl: float = 0
+            if not loss_df.empty:
+                top_loss = loss_df.loc[loss_df["net_pnl"].idxmin()]
+                top_loss_symbol = top_loss["vt_symbol"]
+                top_loss_pnl = top_loss["net_pnl"]
+
+            results.append({
+                "date": result_date,
+                "net_pnl": group_df["net_pnl"].sum(),
+                "holding_pnl": group_df["holding_pnl"].sum(),
+                "trading_pnl": group_df["trading_pnl"].sum(),
+                "commission": group_df["commission"].sum(),
+                "slippage": group_df["slippage"].sum(),
+                "profit_symbol_count": len(profit_df),
+                "loss_symbol_count": len(loss_df),
+                "top_profit_symbol": top_profit_symbol,
+                "top_profit_pnl": top_profit_pnl,
+                "top_loss_symbol": top_loss_symbol,
+                "top_loss_pnl": top_loss_pnl,
+            })
+
+        return DataFrame(results, columns=fields)
+
+    def calculate_daily_top_contributors(self, top_n: int = 10) -> DataFrame:
+        """计算每日盈亏贡献最大的合约"""
+        detail_df: DataFrame = self.calculate_symbol_daily_pnl()
+
+        if detail_df.empty:
+            return detail_df
+
+        sorted_df: DataFrame = (
+            detail_df.assign(abs_net_pnl=detail_df["net_pnl"].abs())
+            .sort_values(["date", "abs_net_pnl"], ascending=[True, False])
+        )
+        top_df: DataFrame = sorted_df.groupby("date", sort=True).head(top_n)
+
+        return top_df.drop(columns=["abs_net_pnl"]).reset_index(drop=True)
+
+    def export_pnl_report(self, path: str | Path | None = None, top_n: int = 10) -> Path:
+        """导出逐日盈亏归因Excel报表"""
+        if path is None:
+            report_path: Path = Path.cwd() / self.generate_pnl_report_filename()
+        else:
+            report_path = Path(path)
+            if report_path.is_dir():
+                report_path = report_path / self.generate_pnl_report_filename()
+
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with ExcelWriter(report_path, engine="openpyxl") as writer:
+            self.calculate_daily_pnl_summary().to_excel(
+                writer,
+                sheet_name="daily_summary",
+                index=False,
+            )
+            self.calculate_symbol_daily_pnl().to_excel(
+                writer,
+                sheet_name="symbol_daily_pnl",
+                index=False,
+            )
+            self.calculate_daily_top_contributors(top_n).to_excel(
+                writer,
+                sheet_name="daily_top_contributors",
+                index=False,
+            )
+
+        return report_path
+
+    def generate_pnl_report_filename(self) -> str:
+        """生成逐日盈亏归因报表文件名"""
+        strategy_name: str = self.strategy.strategy_name
+        timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        return f"detail_{strategy_name}_{timestamp}.log"
+
     def calculate_statistics(self, df: DataFrame = None, output: bool = True) -> dict:
         """计算策略统计指标"""
         self.output(_("开始计算策略统计指标"))
@@ -322,6 +462,8 @@ class BacktestingEngine:
         return_std: float = 0
         sharpe_ratio: float = 0
         return_drawdown_ratio: float = 0
+        calmar_ratio: float = 0
+        trade_statistics: dict = self.calculate_trade_statistics()
 
         # 检查是否发生过爆仓
         positive_balance: bool = False
@@ -380,12 +522,20 @@ class BacktestingEngine:
             return_std = df["return"].std() * 100
 
             if return_std:
-                daily_risk_free: float = self.risk_free / np.sqrt(self.annual_days)
+                daily_risk_free: float = self.risk_free / self.annual_days
                 sharpe_ratio = (daily_return - daily_risk_free) / return_std * np.sqrt(self.annual_days)
             else:
                 sharpe_ratio = 0
 
-            return_drawdown_ratio = -total_net_pnl / max_drawdown
+            if max_drawdown:
+                return_drawdown_ratio = -total_net_pnl / max_drawdown
+            else:
+                return_drawdown_ratio = 0
+
+            if max_ddpercent:
+                calmar_ratio = annual_return / abs(max_ddpercent)
+            else:
+                calmar_ratio = 0
 
         # 输出结果
         if output:
@@ -394,8 +544,8 @@ class BacktestingEngine:
             self.output(_("最后交易日：\t{}").format(end_date))
 
             self.output(_("总交易日：\t{}").format(total_days))
-            self.output(_("盈利交易日：\t{}").format(profit_days))
-            self.output(_("亏损交易日：\t{}").format(loss_days))
+            # self.output(_("盈利交易日：\t{}").format(profit_days))
+            # self.output(_("亏损交易日：\t{}").format(loss_days))
 
             self.output(_("起始资金：\t{:,.2f}").format(self.capital))
             self.output(_("结束资金：\t{:,.2f}").format(end_balance))
@@ -412,16 +562,28 @@ class BacktestingEngine:
             self.output(_("总成交金额：\t{:,.2f}").format(total_turnover))
             self.output(_("总成交笔数：\t{}").format(total_trade_count))
 
-            self.output(_("日均盈亏：\t{:,.2f}").format(daily_net_pnl))
-            self.output(_("日均手续费：\t{:,.2f}").format(daily_commission))
-            self.output(_("日均滑点：\t{:,.2f}").format(daily_slippage))
-            self.output(_("日均成交金额：\t{:,.2f}").format(daily_turnover))
-            self.output(_("日均成交笔数：\t{}").format(daily_trade_count))
+            # self.output(_("日均盈亏：\t{:,.2f}").format(daily_net_pnl))
+            # self.output(_("日均手续费：\t{:,.2f}").format(daily_commission))
+            # self.output(_("日均滑点：\t{:,.2f}").format(daily_slippage))
+            # self.output(_("日均成交金额：\t{:,.2f}").format(daily_turnover))
+            # self.output(_("日均成交笔数：\t{}").format(daily_trade_count))
 
-            self.output(_("日均收益率：\t{:,.2f}%").format(daily_return))
+            self.output(_("已平仓次数：\t{}").format(trade_statistics["total_closed_trade_count"]))
+            self.output(_("盈利次数：\t{}").format(trade_statistics["profit_trade_count"]))
+            self.output(_("亏损次数：\t{}").format(trade_statistics["loss_trade_count"]))
+            self.output(_("胜率：\t{:.2%}").format(trade_statistics["win_rate"]))
+            self.output(_("平均盈利：\t{:,.2f}").format(trade_statistics["average_profit"]))
+            self.output(_("平均亏损：\t{:,.2f}").format(trade_statistics["average_loss"]))
+            self.output(_("盈亏比：\t{:,.2f}").format(trade_statistics["profit_loss_ratio"]))
+            self.output(_("平均每手净利润：\t{:,.2f}").format(
+                trade_statistics["average_net_profit_per_volume"]
+            ))
+
+            # self.output(_("日均收益率：\t{:,.2f}%").format(daily_return))
             self.output(_("收益标准差：\t{:,.2f}%").format(return_std))
             self.output(f"Sharpe Ratio：\t{sharpe_ratio:,.2f}")
             self.output(_("收益回撤比：\t{:,.2f}").format(return_drawdown_ratio))
+            self.output(f"Calmar Ratio：\t{calmar_ratio:,.2f}")
 
         statistics: dict = {
             "start_date": start_date,
@@ -450,6 +612,8 @@ class BacktestingEngine:
             "return_std": return_std,
             "sharpe_ratio": sharpe_ratio,
             "return_drawdown_ratio": return_drawdown_ratio,
+            "calmar_ratio": calmar_ratio,
+            **trade_statistics,
         }
 
         # 过滤极值
@@ -460,6 +624,100 @@ class BacktestingEngine:
 
         self.output(_("策略统计指标计算完成"))
         return statistics
+
+    def calculate_trade_statistics(self) -> dict:
+        """计算逐笔已平仓交易统计指标"""
+        position_queues: defaultdict[str, deque] = defaultdict(deque)
+        closed_pnls: list[float] = []
+        total_closed_volume: float = 0
+
+        trades: list[TradeData] = sorted(
+            self.trades.values(),
+            key=lambda trade: (trade.datetime or datetime.min, trade.tradeid)
+        )
+
+        for trade in trades:
+            if trade.direction not in {Direction.LONG, Direction.SHORT}:
+                continue
+
+            vt_symbol: str = trade.vt_symbol
+            size: float = self.sizes.get(vt_symbol, 1)
+            rate: float = self.rates.get(vt_symbol, 0)
+            slippage: float = self.slippages.get(vt_symbol, 0)
+
+            remaining_volume: float = trade.volume
+            queue: deque = position_queues[vt_symbol]
+            trade_cost_per_volume: float = trade.price * size * rate + size * slippage
+
+            closed_pnl: float = 0
+            closed_volume: float = 0
+
+            while remaining_volume and queue and queue[0]["direction"] != trade.direction:
+                open_trade: dict = queue[0]
+                volume: float = min(remaining_volume, open_trade["volume"])
+
+                if open_trade["direction"] == Direction.LONG:
+                    gross_pnl: float = (trade.price - open_trade["price"]) * volume * size
+                else:
+                    gross_pnl = (open_trade["price"] - trade.price) * volume * size
+
+                cost: float = (open_trade["cost_per_volume"] + trade_cost_per_volume) * volume
+                closed_pnl += gross_pnl - cost
+                closed_volume += volume
+
+                remaining_volume -= volume
+                open_trade["volume"] -= volume
+
+                if not open_trade["volume"]:
+                    queue.popleft()
+
+            if closed_volume:
+                closed_pnls.append(closed_pnl)
+                total_closed_volume += closed_volume
+
+            if remaining_volume:
+                queue.append({
+                    "direction": trade.direction,
+                    "price": trade.price,
+                    "volume": remaining_volume,
+                    "cost_per_volume": trade_cost_per_volume,
+                })
+
+        total_closed_trade_count: int = len(closed_pnls)
+        profit_pnls: list[float] = [pnl for pnl in closed_pnls if pnl > 0]
+        loss_pnls: list[float] = [pnl for pnl in closed_pnls if pnl < 0]
+
+        profit_trade_count: int = len(profit_pnls)
+        loss_trade_count: int = len(loss_pnls)
+        average_profit: float = sum(profit_pnls) / profit_trade_count if profit_trade_count else 0
+        average_loss: float = abs(sum(loss_pnls) / loss_trade_count) if loss_trade_count else 0
+
+        if total_closed_trade_count:
+            win_rate: float = profit_trade_count / total_closed_trade_count
+        else:
+            win_rate = 0
+
+        if average_loss:
+            profit_loss_ratio: float = average_profit / average_loss
+        else:
+            profit_loss_ratio = 0
+
+        total_net_profit: float = sum(closed_pnls)
+        if total_closed_volume:
+            average_net_profit_per_volume: float = total_net_profit / total_closed_volume
+        else:
+            average_net_profit_per_volume = 0
+
+        return {
+            "total_closed_trade_count": total_closed_trade_count,
+            "profit_trade_count": profit_trade_count,
+            "loss_trade_count": loss_trade_count,
+            "win_rate": win_rate,
+            "average_profit": average_profit,
+            "average_loss": average_loss,
+            "profit_loss_ratio": profit_loss_ratio,
+            "average_net_profit_per_volume": average_net_profit_per_volume,
+        }
 
     def calculate_benchmark_curve(self, benchmark_symbol: str, df: DataFrame = None) -> DataFrame | None:
         """计算基准归一化资金曲线"""
