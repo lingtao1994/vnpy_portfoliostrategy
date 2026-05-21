@@ -425,7 +425,7 @@ class BacktestingCashTest(TestCase):
         self.assertEqual(first_day["vt_symbol"], SECOND_VT_SYMBOL)
         self.assertAlmostEqual(first_day["net_pnl"], -102.2)
 
-    def test_export_pnl_report_uses_default_log_filename_and_expected_sheets(self) -> None:
+    def test_export_pnl_report_uses_default_excel_filename_and_expected_sheets(self) -> None:
         engine = create_two_symbol_engine()
         add_two_symbol_daily_results(engine)
 
@@ -433,7 +433,7 @@ class BacktestingCashTest(TestCase):
             report_path = engine.export_pnl_report(path=Path(directory), top_n=1)
 
             self.assertEqual(report_path.parent, Path(directory))
-            self.assertRegex(report_path.name, r"^detail_CashTestStrategy_\d{8}_\d{6}\.log$")
+            self.assertRegex(report_path.name, r"^detail_CashTestStrategy_\d{8}_\d{6}\.xlsx$")
 
             workbook = ExcelFile(report_path, engine="openpyxl")
             self.assertEqual(

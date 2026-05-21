@@ -427,7 +427,7 @@ class BacktestingEngine:
         strategy_name: str = self.strategy.strategy_name
         timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        return f"detail_{strategy_name}_{timestamp}.log"
+        return f"detail_{strategy_name}_{timestamp}.xlsx"
 
     def calculate_statistics(self, df: DataFrame = None, output: bool = True) -> dict:
         """计算策略统计指标"""
